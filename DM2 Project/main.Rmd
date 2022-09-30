@@ -1,0 +1,723 @@
+---
+title: "A classification system to detect questionable information"
+author:
+  - "Pedro Mota"
+  - "Tatiana Araújo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("~/Dropbox/dm2/dm2_assign/")
+set.seed(42)
+```
+
+# Introduction
+From a data set comprised of 18k tweets about the last U.S. Presidential election, which were retrieved before the election was held, labeled as questionable or not, the goal of this project was to create a classification system for tweets in order to identify where a new (unseen) tweet is disseminating questionable information, or not. Despite the simple problem statement, it is a hard task because natural language is full of ambiguities and imprecise characteristics, therefore making it impossible for a human to devise, manually, a set of rules to determine if a tweet contains questionable information or not. With this in mind, we tried to tackle this problem by exploiting, for the questionable and non-questionable tweets, the different vocabulary used (which can be captured by a term frequency analysis), the different sentiment and emotion distribution and, also, the conflicting valence found in the tweets, usually called *emotional entropy*, which can be thought of as a measure of unpredictability and surprise based on the consistency or inconsistency of the emotional language in a given message and used this information in machine learning algorithms.
+
+For all the analysis, we used the language R and some of its packages from the CRAN, which we will load now:
+```{r Library importation,warning=FALSE,message=FALSE}
+library(tidyverse)
+library(dlookr)
+library(cowplot)
+library(tm)
+library(text2vec)
+library(ggplot2)
+library(wordcloud)
+library(superml)
+library(Hmisc)
+library(syuzhet)
+library(caret)
+library(reshape2)
+library("ggpubr")
+library(DMwR)
+```
+
+## Data importation
+
+We will start, by reading the .csv file, containing the data, as a tibble.
+``` {r Data Importation, warning=FALSE,message=FALSE}
+ds <- as_tibble(read_csv("FN-Dataset-18k.csv"))
+```
+
+A first glimpse of the data:
+```{r}
+glimpse(ds)
+```
+
+One can see that, the columns ending with *count* are wrongly typed, ie., they are typed as doubles, but they are integer values. Also, we converted the **user_verified** and **contains_profanity** from logical to 0/1 integer values and the target variable **questionable_domain** from a logical value to a factor:
+```{r Type conversion}
+ds <- mutate(ds, 
+            user_friends_count = as.integer(user_friends_count),
+            user_followers_count = as.integer(user_followers_count),
+            user_favourites_count = as.integer(user_favourites_count),
+            retweet_count = as.integer(retweet_count),
+            favorite_count = as.integer(favorite_count),
+            user_verified = as.integer(user_verified),
+            contains_profanity = as.integer(contains_profanity),
+            questionable_domain = as.factor(questionable_domain)
+)
+```
+
+Other thing that we noticed is that the attribute *title* is redundant.
+Firstly, there are only 13 cases where the attribute *title* is different than the attribute *description*:
+```{r Title == Description }
+sum(as.integer(ds$title != ds$description))
+```
+And, in those cases (and also in the ones where they are exactly equal), the attribute *title* is a prefix of the *description* attribute.
+```{r Title is a prefix of Description}
+all(startsWith(ds$description, ds$title))
+```
+So, we can remove the *title* field.
+```{r Title field removal}
+ds <- select(ds, -title)
+```
+
+Let's now look for missing values and duplicate observations, which can compromise our analysis. For that, we will use the package *dlookr*:
+```{r NAsDuplicates}
+overview(ds)
+```
+
+As we can see, there is no missing values, neither duplicates in our data set.
+
+Regarding outliers, we concluded that we don't have any of them. Mainly, because the data collection was autonomously done and it doesn't suffer from reading problems, such as sensor data. Also, we inspected the range of the values for these attributes and they all seem plausible, as we can see:
+```{r MinMax numerical attributes}
+min_num_cols = apply(select(ds, ends_with("count")), 2, min)
+max_num_cols = apply(select(ds, ends_with("count")), 2, max)
+
+df <- data.frame(min_num_cols, max_num_cols)
+colnames(df) <- c('Min' , 'Max')
+df[-1,]
+```
+```{r, include=FALSE}
+rm(min_num_cols, max_num_cols, df)
+```
+
+## Baseline Model
+Before we further process and analyse our data, let's create a simple baseline model.
+
+Prior to the baseline model, let's split our data set in two independent data sets, one in which we will perform our analysis and train our models and other set, which we will never use, until the very end, where we will do a final prediction on unseen data:
+```{r dataset split}
+inTrain <- createDataPartition(y = ds$questionable_domain, p = 0.85, list = FALSE)
+ds_train <- ds %>% dplyr::slice(inTrain)
+ds_test <- ds %>% dplyr::slice(-inTrain)
+```
+```{r, include=FALSE}
+rm(ds, inTrain)
+```
+
+Let's just make sure that the distribution of the data between the training set and testing set are similar.
+```{r}
+piechart_dist <- function(ds) {
+  data <- data.frame(
+    Domain=c('Questionable', 'Non questionable'),
+    value=c(nrow(filter(ds, questionable_domain==T)),  nrow(filter(ds, questionable_domain==F)))
+  )
+  
+  data <- data %>% 
+    arrange(desc(Domain)) %>%
+    mutate(prop = value / sum(data$value) *100) %>%
+    mutate(ypos = cumsum(prop)- 0.5*prop )
+  
+  plot <- ggplot(data, aes(x="", y=value, fill=Domain)) +
+    geom_bar(stat="identity", width=1, color="white") +
+    coord_polar("y", start=0) +
+    theme_void()
+  plot
+}
+
+plot_grid(piechart_dist(ds_train), piechart_dist(ds_test), labels = c("ds_train", "ds_test"), scale=1.1)
+```
+```{r, include=FALSE}
+rm(piechart_dist)
+```
+
+As we can see, both follow the same distribution as required.
+
+For the baseline model, we could create one model that simply outputs that the tweet is non-questionable. Since, in the whole data set, we have 3000 questionable tweets and, therefore, 14950 non-questionable tweets, we would get an accuracy around 83%, a precision of 100% but a recall of 0%. 
+
+Instead of this, we decided to use five models (with variations):
+- k-Nearest Neighbors (with k equals to 5, 8, 11 and 14) 
+- Naive Bayes (with Laplace correction of 1)
+- XGBoost (using 50, 100, 150 and 200 iterations)  
+- Random Forests (with 300 trees)
+- Neural Networks (we used only one hidden layer and varied the number of neurons for the hidden layer from 1 to the number of attributes)
+
+Now, let's build a pipeline. We will estimate the *accuracy*, the *precision*, the *recall* and the *F1 measure*, using the 10-fold cross validation method:
+```{r pipeline, results='hide'}
+fit <- function(x_train, y_train, x_test, y_test) {
+    results <- tibble()
+
+    # 10-fold Cross Validation  
+    control = trainControl(method  = "cv", number  = 10, classProbs = F)
+    
+    # k-NN
+    cat("k-NN... ")
+    knn_model <- train(x = x_train,
+                       y = y_train,
+                       method     = "knn",
+                       tuneGrid   = expand.grid(k = seq(from=5, to=15, by=3)),
+                       trControl  = control)
+    knn_results <- predict(knn_model, x_test)
+    knn_conf <- confusionMatrix(knn_results, y_test)
+    results <- rbind(results, c(knn_conf$overall["Accuracy"], knn_conf$byClass["Precision"], knn_conf$byClass["Recall"], knn_conf$byClass["F1"]))
+    cat("DONE\n")
+    
+    # NAIVE BAYES
+    cat("Naive Bayes... ")
+    nb_model = train(x = x_train,
+                     y = y_train,
+                     method = 'naive_bayes',
+                     trControl = control,
+                     tuneGrid = data.frame(usekernel = TRUE, laplace = 1, adjust = 1))
+    nb_results <- predict(nb_model, x_test)
+    nb_conf <- confusionMatrix(nb_results, y_test)
+    results <- rbind(results, c(nb_conf$overall["Accuracy"], nb_conf$byClass["Precision"], nb_conf$byClass["Recall"], nb_conf$byClass["F1"]))
+    cat("DONE\n")
+    
+    # XGBOOST
+    cat("XGBoost... ")
+    xgb_model = train(x = x_train,
+                      y = y_train,
+                      trControl = control,
+                      method = "xgbTree",
+                      tuneGrid = expand.grid(nrounds = c(50,100,150,200), max_depth = c(2,5), eta = 0.05, gamma = 0.01, 
+                                      colsample_bytree = c(0.3,0.7), min_child_weight=0, subsample = 0.7),
+                      verbosity = 0)
+    #varImp(xgb_model)
+    xgb_results <- predict(xgb_model, x_test)
+    xgb_conf <- confusionMatrix(xgb_results, y_test)
+    results <- rbind(results, c(xgb_conf$overall["Accuracy"], xgb_conf$byClass["Precision"], xgb_conf$byClass["Recall"], xgb_conf$byClass["F1"]))
+    cat("DONE\n")
+
+    # RANDOM FOREST
+    cat("Random Forest... ")
+    rf_model <- train(x = x_train,
+                      y = y_train,
+                      method = "ranger",
+                      trControl = control,
+                      tuneGrid = expand.grid(.mtry = seq(from=2, to=ceil(ncol(x_train)/2), by=3), .splitrule="gini", .min.node.size = c(2, 5, 10, 20)),
+                      num.trees = 300,
+                      importance = "impurity")
+    #varImp(rf_model)
+    rf_results <- predict(rf_model, newdata=x_test)
+    rf_conf <- confusionMatrix(rf_results, y_test)
+    results <- rbind(results, c(rf_conf$overall["Accuracy"], rf_conf$byClass["Precision"], rf_conf$byClass["Recall"], rf_conf$byClass["F1"]))
+    cat("DONE\n")
+
+    # NEURAL NETS
+    cat("Neural Net... ")
+    nnet_model <- train(x = x_train,
+                       y = y_train,
+                       method = 'nnet',
+                       trControl = control,
+                       tuneGrid=expand.grid(size=1:ncol(x_train), decay=c(0.1)),
+                       trace=F)
+    nnet_results <- predict(nnet_model, x_test)
+    nnet_conf <- confusionMatrix(nnet_results, y_test)
+    results <- rbind(results, c(nnet_conf$overall["Accuracy"], nnet_conf$byClass["Precision"], nnet_conf$byClass["Recall"], nnet_conf$byClass["F1"]))
+    cat("DONE\n")
+    
+    colnames(results) <- c("Accuracy", "Precision", "Recall", "F1")
+    rownames(results) <- c("kNN", "Naive Bayes", "XGBoost", "Random Forests", "Neural Networks")
+    results
+}
+```
+
+Now let's train our baseline model:
+```{r, warning=FALSE, results='hide'}
+x_train <- select(ds_train, -c(id, description, questionable_domain))
+y_train <- ds_train$questionable_domain
+x_test <- select(ds_test, -c(id, description, questionable_domain))
+y_test <- ds_test$questionable_domain
+
+baseline.results <- fit(x_train, y_train, x_test, y_test)
+```
+
+Let's check the results that we got:
+```{r, printbaselineresults}
+baseline.results
+```
+
+```{r, include=F}
+rm(x_train, y_train, x_test, y_test)
+```
+
+The Random Forest model was the best in every metric, expect on the Recall, where XGBoost and Neural Networks got a Recall of 100%. The XGBoost and Neural Networks models took advantage of the fact that the target variable is unbalanced - they are simply classifying the tweet as non-questionable, as our original baseline model idea.
+
+## Data exploration and pre-processing
+We will now explore the data, by means of summarization and visualization, as to get useful insights. We will also look into the correlation between our variables and also their correlation with the target variable.
+
+Firstly, we will explore how the user activity is related to the questionability of the tweet. The attributes regarding the user activity are: *user_verified*, *user_friends_count*, *user_followers_count* and *user_favourites_count*.
+
+Firstly, regarding the *user_verified* attribute, we expect that verified users don't post questionable tweets, since they usually represent notable people or organizations, such as government officials. 
+
+Let's try to confirm our guess by computing the % of questionable tweets that posted by verified users and also the: 
+```{r user_verified analysis}
+df <- data.frame(c(nrow(filter(ds_train, user_verified==T, questionable_domain==T)) / nrow(filter(ds_train, questionable_domain==T)) * 100,
+           nrow(filter(ds_train, user_verified==F, questionable_domain==T)) / nrow(filter(ds_train, questionable_domain==T)) * 100),
+           c(nrow(filter(ds_train, user_verified==T, questionable_domain==F)) / nrow(filter(ds_train, questionable_domain==F)) * 100,
+           nrow(filter(ds_train, user_verified==F, questionable_domain==F)) / nrow(filter(ds_train, questionable_domain==F)) * 100))
+colnames(df) <- c('Questionable tweet', 'Non questionable')
+row.names(df) <- c('Verified user', 'Non verified user')
+df
+```
+As we can see, the vast majority of verified users post non-questionable tweets, making *user_verified* a relevant attribute.
+
+Regarding the *user_followers_count*, for the same reason as before, we expect to see users with an high number of followers, to not post questionable tweets.
+```{r user_followers_count}
+ggplot(ds_train, aes( fill = questionable_domain, x=user_followers_count)) + geom_histogram( breaks=c(0,4000,8000,12000,16000,20000,30000,40000))+ ggtitle("Distribution of user_followers_count ") + ylab("Count")
+```
+
+The above plot confirms our guesses.
+
+Regarding the *user_friends_count*, we were more unsure about our intuitions, because an high number of friends means that the user follows an high number of users and so it will be more informed, but it can also mean, for instance, that we are in a presence of a Twitter Bot, which will follow everyone automatically in order to be noticed and spread their message, which may be of a questionable nature.
+```{r user_friends_count}
+ggplot(ds_train, aes( fill = questionable_domain, x=user_friends_count)) + geom_histogram( breaks=c(0,400,800,1200,1600,2000,3000,4000))+ ggtitle("Distribution of user_friends_count ") + ylab("Count")
+```
+
+To our surprise, *user_friends_count* follows roughly the same distribution as the attribute *user_followers_count*.
+
+With respect to *user_favourites_count*, we don't expect to see any correlation with the target variable, for the same reason as before, but in this case, it's even harder to make a case for this attribute.
+```{r user_favourites_count}
+ggplot(ds_train, aes( fill = questionable_domain, x=user_favourites_count)) + geom_histogram( breaks=c(0,5000,10000,15000,20000,25000,30000,40000,45000,50000))+ ggtitle("Distribution of user_favourites_count ") + ylab("Count")
+```
+
+Again, to our surprise, *user_favourites_count* follows roughly the same distribution as the attribute *user_followers_count*.
+All of this attributes, regarding the tweet activity will be important to classify if a tweet is questionable or not.
+
+Now, we will explore how the tweet activity is related to the questionability of the tweet. The attributes regarding the twitter activity are: *favorite_count* and *retweet_count*. We expect to see a negative correlation between the two attributes and the target variable, meaning the higher both of them are, we expect the tweet to be non-questionable, because a tweet with high positive activity - we say 'positive activity' because, here, the activity is based on the number of favorites and retweets, which are usually done by the users who agree on the message and not on the number of comments, for instance, which an high amount of them, can mean an high amount of negative comments - therefore meaning that there are a considerable number of people agreeing.
+
+```{r}
+ggplot(data=subset(ds_train, retweet_count<500 & favorite_count<2000), mapping = aes(x = retweet_count, y = favorite_count)) + geom_point(aes(color = questionable_domain)) + theme_bw()
+```
+
+As we can see, tweets with an higher engagement tend to not contain questionable information, as we expected.
+
+We will now explore the correlation between all the numeric variables. We expect to see a positive correlation between them, mainly because they are related to either the user or the tweets activity.
+
+```{r correlation matrix}
+res <- cor(select(ds_train, -c(id, description, questionable_domain)), method="spearman")
+res
+```
+
+A bit hard to read. Let's improve the visualization of the correlation matrix with the function *symmnun* from the package *stats*:
+```{r}
+symnum(res, abbr.colnames = F)
+```
+
+As we can see, we have a lot of correlation between our variables, namely between the ones regarding the user activity and between the ones regarding the tweet activity! 
+
+We could simply remove one of the correlated variables, but we decided to perform a principal component analysis in order to remove the correlation between our variables and even reduce the dimensionality of our data set:
+```{r}
+ds_train.pca <- prcomp(select(ds_train, -c(id, description, questionable_domain)), center = TRUE, scale. = TRUE)
+ds_test.pca <- prcomp(select(ds_test, -c(id, description, questionable_domain)), center = TRUE, scale. = TRUE)
+
+summary(ds_train.pca)
+```
+From the above matrix, one can see that the first six components already explain almost 98% of the variability of the data. The last principal component only explains roughly 2% of the data. This means if we use the first six principal components, we have one less variable than the 7 original ones and we still maintain roughly 98% of the variability in the data.
+
+With this in mind, we can remove the old numeric attributes and use the new principal components:
+```{r}
+ds_train <- select(ds_train, -c(user_verified, user_favourites_count, user_followers_count, user_friends_count,
+                    retweet_count, favorite_count, contains_profanity))
+ 
+ds_train <-cbind(ds_train, ds_train.pca$x[,1:6])
+
+ds_test <- select(ds_test, -c(user_verified, user_favourites_count, user_followers_count, user_friends_count,
+                    retweet_count, favorite_count, contains_profanity))
+ 
+ds_test <-cbind(ds_test, ds_test.pca$x[,1:6])
+```
+
+```{r, include=F}
+rm(ds_train.pca, ds_test.pca)
+```
+
+Finally, we will look into the content of the descriptions of the tweets, that is, the field *description*.
+Let's first look into a tweet that is questionable and one that is not, respectively:
+```{r}
+print(c(filter(ds_train, questionable_domain==T)[1,]$description, filter(ds_train, questionable_domain==F)[1,]$description))
+```
+We will now look into the word cloud of the tweets regarding the questionable tweets and the non-questionables, respectively. In a word cloud, the size of the texts in the image represent the frequency or importance of the words in the training data.
+
+Let's first create the corpus and clean-up the text, by convert all letters to lower case, removing numbers, removing punctuation, removing white spaces, removing hyperlinks and removing stop words, which provide no useful information. We've also removed the words *via* and *'s*, since they appeared frequently but are irrelevant:
+
+```{r warning=FALSE,message=FALSE}
+questionable_tweets <- Corpus(VectorSource(filter(ds_train, questionable_domain==T)$description))
+non_questionable_tweets <- Corpus(VectorSource(filter(ds_train, questionable_domain==F)$description))
+
+cleanup <- function(docs, spec.words=NULL) {
+  #Replacing "/", "@" and "|" with space
+  toSpace <- content_transformer(function (x , pattern) gsub(pattern, " ", x))
+  # Remove hyperlinks, since in every description every tweet has its own URL
+  docs <- tm_map(docs, content_transformer(function(x) gsub(x, pattern = "https://.* ", replacement = " ")))
+  # Convert the text to lower case
+  docs <- tm_map(docs, content_transformer(tolower))
+  # Remove numbers
+  docs <- tm_map(docs, removeNumbers)
+  # Remove english common stopwords
+  docs <- tm_map(docs, removeWords, stopwords("english"))
+  # Remove your own stop word
+  # Specify your stopwords as a character vector
+  if(!is.null(spec.words))
+    docs <- tm_map(docs, removeWords, spec.words)
+  # Remove punctuations
+  docs <- tm_map(docs, removePunctuation)
+  # Eliminate extra white spaces
+  docs <- tm_map(docs, stripWhitespace)
+  # Text stemming
+  docs <- tm_map(docs, stemDocument)
+  docs
+}
+
+stopwords <- c("via", "'s")
+questionable_tweets <- cleanup(questionable_tweets, stopwords)
+non_questionable_tweets <- cleanup(non_questionable_tweets, stopwords)
+```
+
+```{r, include=F}
+rm(stopwords)
+```
+
+We can, finally, look into the word clouds:
+```{r WordCloud quest}
+wordcloud(questionable_tweets, min.freq = 5, max.words=120, scale = c(4, 2), random.order=FALSE, rot.per=0.40, colors=brewer.pal(8, "Dark2"))
+```
+
+```{r WordCloud non-quest}
+wordcloud(non_questionable_tweets, min.freq = 5, max.words=120, scale = c(4, 2), random.order=FALSE, rot.per=0.40, colors=brewer.pal(8, "Dark2"))
+```
+
+As we can see, besides the obvious appearances of terms like *trump*, *realdonaldtrump* (which was the Twitter username for Donald Trump's official account), *biden*, there are some differences on the terms being used in the questionable and non-questionable tweets. 
+
+Let's plot the term frequency for each of them:
+```{r TF plot, warning=F, results='hide'}
+questionable_tweets_dtm <- DocumentTermMatrix(questionable_tweets, control = list(weighting = function(x) weightTfIdf(x, normalize = FALSE), stopwords = TRUE))
+
+non_questionable_tweets_dtm <- DocumentTermMatrix(non_questionable_tweets, control = list(weighting = function(x) weightTfIdf(x, normalize = FALSE), stopwords = TRUE))
+
+plot_frequent_words <- function(dtm) {
+  mdf <- as_tibble(as.matrix(dtm))
+  mdf.freq <- mdf %>% select(findFreqTerms(dtm,nDocs(dtm)/5)) %>% summarise_all(sum) %>% gather()
+  mdf.freq$key <- factor(mdf.freq$key, levels = mdf.freq$key[order(mdf.freq$value)])
+  plot <- ggplot(mdf.freq[1:10,] ,aes(x=key,y=value)) + geom_bar(stat="identity") + labs(x="Term",y="Frequency") + coord_flip()
+  plot
+}
+```
+
+Firstly, for the non-questionable tweets:
+```{r non_quest freq terms}
+plot_frequent_words(non_questionable_tweets_dtm)
+```
+
+And, now, for the questionable tweets:
+```{r quest freq terms}
+plot_frequent_words(questionable_tweets_dtm)
+```
+
+```{r, include=F}
+rm(plot_frequent_words)
+```
+
+Again, confirming our hypothesis, depending on the type of the tweet, the frequent terms are different, so we can use this information to classify the tweets.
+
+Let's see how the main candidates, Biden and Trump, are portraied in the questionable and non-questionable tweets:
+```{r Trump NonQuest}
+findAssocs(non_questionable_tweets_dtm, terms = c("trump"), corlimit = 0.1)
+```
+```{r Trump Quest}
+findAssocs(questionable_tweets_dtm, terms = c("trump"), corlimit = 0.1)
+```
+
+```{r Biden NonQuest}
+findAssocs(non_questionable_tweets_dtm, terms = c("biden"), corlimit = 0.1)
+```
+```{r Biden Quest}
+findAssocs(questionable_tweets_dtm, terms = c("biden"), corlimit = 0.1)
+```
+
+As we can see, in the questionable tweets, the terms related to Trump are terms, generally, related to the right-wing world. In the questionable tweets, Biden is related to some controversial terms, but, as far as we known, they are related to his son, Hunter Biden, which we will explore later. In the non-questionable tweets, it's actually curious to see Biden being associated to terms such as *enemi*, *china* and *socialist*, this really shows the dichotomy of Republicans vs Democrats, in the U.S. elections.
+
+For instance, in the questionable tweets it appears *gatewaypundit* as a frequent word. The Gateway Pundit is an American far-right fake news website.
+
+```{r gatewaypundit analysis}
+print(sum(as.integer(str_detect(filter(ds_train, questionable_domain==T)$description, "gatewaypundit"))) / nrow(filter(ds_train, questionable_domain==T)) * 100)
+```
+```{r gatewaypundit analysis2}
+print(sum(as.integer(str_detect(filter(ds_train, questionable_domain==F)$description, "gatewaypundit"))) / nrow(filter(ds_train, questionable_domain==F)) * 100)
+```
+
+As we can see, 36.5% of the questionable tweets contain the term *gatewaypundit*, but the same term only occurs roughly 0.03% in the non-questionable tweets. This gives the term *gatewaypundit* a high discriminant power to distinguish between the two sets of tweets.
+
+Also, in the questionable tweets, it appears frequently the word *hunter*, which, probably, refers to the son of Joe Biden, Hunter Biden, as we said before. 
+
+Our first idea was that the content of the tweets were probably related to his, supposedly, controversial life style and business activities, which was a topic, again, recovered with the war in Ukraine. 
+
+To confirm our thesis, let's find the associations with his name, with minimum correlation of 0.25:
+```{r}
+findAssocs(questionable_tweets_dtm, terms = c("hunter"), corlimit = 0.25)
+```
+
+As we can see, the most associated words to his name (excluding his last name, Biden) are related to the history of his laptop, which allegedly belonged to him and was later recovered, and, with this, a trove of personal emails and photographs found on it, which lead to the various stories stated above. All of this was published less than three weeks before the presidential election, by the New York Post - https://nypost.com/2020/10/14/email-reveals-how-hunter-biden-introduced-ukrainian-biz-man-to-dad.  
+
+Since he was the son of one of the candidates to the 2020 presidentials, he was a recurrent topic brought by the Republican Party, the main opposition party. Since none of this is, at least, officially, confirmed, it's natural that all of this information is classified as questionable.
+
+Regarding the non-questionable tweets, one term that appears frequent is the term *nytim*, which refers to the American daily newspaper *The New York Times*.
+Let's find the terms associated to the newspaper:
+```{r}
+findAssocs(questionable_tweets_dtm, terms = c("nytim"), corlimit = 0.24)
+```
+
+As we can see, it's all other newspapers and television news program hosts, such as *joenbc*, which refers to Joe Scarborough, a television host, political commentator, and former politician who is the co-host of Morning Jo and *maddow*, which refers to Rachel Anne Maddow, an American television news program host and liberal political commentator. Both terms, are theirs Twitter's usernames.
+
+What we thought that could be interesting to analyse, was the term frequency of these terms in the questionable and in the non-questionable tweets, since, specially during the final stage of the presidentials campaigns, a lot is said about the impartiality of these news programs.
+
+Let's then plot the distribution of these terms regarding the questionability of the tweet:
+```{r, warning=FALSE}
+midia <- c("nytim", "washingtonpost", "nbcnew", "cnnbrk", "nypost", "joenbc", "msnbc", "abcpolit", "abcnew", "morningjo", "maddow")
+
+midia_non_quest <- as_tibble(as.matrix(non_questionable_tweets_dtm)[,midia][,1:length(midia)])
+midia_non_quest <- mutate(midia_non_quest, questionable_domain=as.factor("FALSE"))
+
+midia_quest <- as_tibble(as.matrix(questionable_tweets_dtm)[,midia][,1:length(midia)])
+midia_quest <- mutate(midia_quest, questionable_domain=as.factor("TRUE"))
+
+midia_data <- rbind(midia_non_quest, midia_quest)
+
+gg <- melt(midia_data, id="questionable_domain")
+colnames(gg) <- c("questionability", "variable", "value")
+ggplot(gg, aes(x=variable, y=value, fill=questionability)) + 
+    stat_summary(fun.y=mean, geom="bar",position=position_dodge(1)) + 
+    scale_color_discrete("questionability")
+```
+
+```{r, include=F}
+rm(midia, midia_non_quest, midia_quest, gg)
+rm(non_questionable_tweets, non_questionable_tweets_dtm, questionable_tweets, questionable_tweets_dtm)
+```
+
+Sadly, only the *nytim* term seems to have a significant difference regarding the type of the tweet. We inspected the tweets that contain the term and it seems to be mostly citations of the news. 
+
+Also, we would need major care to conclude something if a different distribution regarding the tweets appeared, since the questionability of the tweets containing any of these newspaper can be due to wrong citations and/or false accusations, which, with a analysis only from the distribution regarding both set of tweets, would influence the agency negatively, but, in reality, it's nothing related to the agency itself.
+
+In any case, it's clear that the term frequency may be useful to distinguish between both set of tweets, so, with this in mind, in order to gain advantage of this, we added new 13 features, which we chose from the plot of the most frequent ones, representing the terms and their tf-idf scores:
+```{r TfIdfVectorizer, results='hide', warning=FALSE}
+TfIdfVetorizer <- function(ds) {
+  tweets <- Corpus(VectorSource(ds$description))  
+  tweets <- cleanup(tweets)
+  dtm <- DocumentTermMatrix(tweets, control = list(weighting = function(x) weightTfIdf(x, normalize = T)))
+
+  ds <- cbind(ds, as.matrix(dtm)[, c("trump", "amp", "time", "nytim", "presid", "covid", 
+                                     "gatewaypundit", "biden", "video", "hunter", "will")])
+  ds  
+}
+
+ds_train <- TfIdfVetorizer(ds_train)
+ds_test <- TfIdfVetorizer(ds_test)
+```
+
+For instance, the first 15 observations for the new attribute *trump*:
+```{r}
+ds_train$trump[1:15]
+```
+
+We used both terms *trump* and *biden*, even though they appear both frequent in both set of tweets, because depending on the content, it may be helpful to
+
+```{r, include=FALSE}
+rm(cleanup)
+```
+
+Let's now do a emotion and sentiment analysis:
+```{r Sentiment Analysis, warning=FALSE}
+emotions <- c("anger", "anticipation", "disgust", "fear", "joy", "sadness", "surprise", "trust", "negative", "positive")
+
+nrc_data_train <- get_nrc_sentiment(ds_train$description)
+nrc_data_test <- get_nrc_sentiment(ds_test$description)
+
+gg <- melt(cbind(nrc_data_train[,1:10], ds_train$questionable_domain), id="ds_train$questionable_domain")   # df is your original table
+colnames(gg) <- c("questionability", "variable", "value")
+ggplot(gg, aes(x=variable, y=value, fill=questionability)) + 
+  stat_summary(fun.y=mean, geom="bar",position=position_dodge(1)) + 
+  scale_color_discrete("questionability") #+ stat_summary(fun.ymin=min,fun.ymax=max,geom="errorbar", color="grey80",position=position_dodge(1), width=.2)
+```
+
+Sadly, we see the same distribution for the positive or negative valence and for the emotions, in both set of tweets.
+
+This is quite intuitive, because it's easy to imagine that a user can have both positive and negative sentiments and emotions writing a tweet that is questionable or not. 
+
+With further analysis, what we noticed is that in the questionability tweets, the emotions tend to reach higher absolute values than in the non-questionable tweets. 
+
+Let's do a summary for the non-questionable tweets:
+```{r}
+id_nrc_data_train <- cbind(id=ds_train$id, nrc_data_train)
+id_nrc_data_test <- cbind(id=ds_test$id, nrc_data_test)
+
+nrc_data_non_quest <- filter(id_nrc_data_train, id %in% filter(ds_train, questionable_domain==F)$id)
+
+lapply(nrc_data_non_quest[,-1], summary)
+```
+
+Now for the questionable tweets:
+```{r}
+nrc_data_quest <- filter(id_nrc_data_train, id %in% filter(ds_train, questionable_domain==T)$id)
+
+lapply(nrc_data_quest[,-1], summary)
+```
+
+As we can see, specially at the maximum values, the non-questionable tweets are always significantly higher.
+
+With this in mind, we decided to add a new feature, called **extreme_emotion**, which is true if any of these emotions gets higher than it's mean:
+```{r}
+ds_train$extreme_emotion = 0
+for (i in 1:nrow(ds_train)) {
+  if(any(nrc_data_train[i,] > 5)) {
+    ds_train$extreme_emotion[i] = 1
+  }
+}
+
+ds_test$extreme_emotion = 0
+for (i in 1:nrow(ds_test)) {
+  if(any(nrc_data_test[i,] > 5)) {
+    ds_test$extreme_emotion[i] = 1
+  }
+}
+```
+
+If we had time stamps from when the tweet was posted, we could also see how all of this changed over time. We could even try to see the changes in the public opinion, in the face of dramatic events, such as when the history involving Hunter Biden's laptop went public.
+
+Also, we will look into the emotional ambiguity, i.e., the conflicting valence found in the tweet. Emotional entropy can be thought of as a measure of unpredictability and surprise based on the consistency or inconsistency of the emotional language in a given message. We expect this to be important, since questionable tweets tend to be unpredictable and sometimes even contradictory: 
+```{r MixedMessages}
+ds_train_tweets_mixed_messages <- lapply(ds_train$description, mixed_messages)
+ds_train_tweets_mixed_messages <- do.call(rbind, ds_train_tweets_mixed_messages)
+
+ds_test_tweets_mixed_messages <- lapply(ds_test$description, mixed_messages)
+ds_test_tweets_mixed_messages <- do.call(rbind, ds_test_tweets_mixed_messages)
+```
+
+```{r, warning=FALSE}
+gg <- melt(cbind(tibble(metric_entropy=ds_train_tweets_mixed_messages[,2]), ds_train$questionable_domain))
+colnames(gg) <- c("questionability", "variable", "value")
+ggplot(gg, aes(x=variable, y=value, fill=questionability)) + 
+  stat_summary(fun.y=mean, geom="bar",position=position_dodge(1)) + scale_color_discrete("questionability")
+```
+
+Surprisingly, we see a evenly distributed metric entropy between the two sets of tweets.
+
+In any case, we will add a new column **metric_entropy**, containing the metric entropy of the tweet, for the reasons stated before and we saw that it is useful through some experimental tests:
+```{r}
+ds_train <- cbind(ds_train, metric_entropy=ds_train_tweets_mixed_messages[,2])
+ds_test <- cbind(ds_test, metric_entropy=ds_test_tweets_mixed_messages[,2])
+```
+
+```{r, include=FALSE}
+ds_train <- drop_na(ds_train)
+ds_test <- drop_na(ds_test)
+rm(ds_train_tweets_mixed_messages, ds_test_tweets_mixed_messages)
+```
+
+Finally, we can remove the **description** attribute:
+```{r}
+ds_train <- select(ds_train, -description)
+ds_test <- select(ds_test, -description)
+```
+
+A view of the final, improved, data set:
+```{r}
+glimpse(ds_train)
+```
+
+Let's train our models, again, but now with the improvements done:
+```{r Improved , results='hide'}
+x_train = select(ds_train, -c(id, questionable_domain))
+y_train <- ds_train$questionable_domain
+x_test = select(ds_test, -c(id, questionable_domain))
+y_test = ds_test$questionable_domain
+
+improved.results <- fit(x_train, y_train, x_test, y_test)
+```
+```{r}
+improved.results
+```
+
+As we can see, every metric was improved, for every model. The models aren't now only abusing the unbalanced domain.
+
+We even tried to balance our data set, by doing both under-sampling and over-sampling:
+```{r SMOTE, results='hide'}
+balanced.ds <- SMOTE(questionable_domain ~ ., 
+                     data = as.data.frame(select(ds_train, -id)), 
+                     perc.over = 100,
+                     k = 11, 
+                     perc.under = 200)
+```
+
+Let's test it:
+```{r SMOTE Balanced Fitting, results='hide', warning=FALSE}
+x_train <- select(balanced.ds, -c(questionable_domain))
+y_train <- balanced.ds$questionable_domain
+x_test <- select(ds_test, -c(questionable_domain))
+y_test <- ds_test$questionable_domain
+
+balanced.results <- fit(x_train, y_train, x_test, y_test)
+```
+```{r}
+balanced.results
+```
+
+As we can see, we got worse results. This is because SMOTE does linear interpolation of the data and since we mainly working with features extracted from text, linear interpolation becomes meaningless.
+
+Sadly, we got worse results, in every metric we measured, relatively to the results we got when ignoring the class-imbalanced domain.
+
+We also tried to just do under-sampling of the majority class, but still, we got worse results for every model:
+```{r Undersampling, results='hide'}
+balanced.ds <- rbind(filter(ds_train, questionable_domain==T), filter(ds_train, questionable_domain==F)[1:nrow(filter(ds_train, questionable_domain==T)),])
+balanced.ds <- slice(balanced.ds, sample(1:n()))
+
+x_train <- select(balanced.ds, -c(id, questionable_domain))
+y_train <- balanced.ds$questionable_domain
+x_test <- select(ds_test, -c(id, questionable_domain))
+y_test <- ds_test$questionable_domain
+
+balanced.results <- fit(x_train, y_train, x_test, y_test)
+```
+```{r}
+balanced.results
+```
+
+```{r, include=F}
+rm(x_train, y_train, x_test, y_test)
+```
+
+So, overall, our best model was a XGBoost model.
+
+Let's do a final predict on the unseen data and check the results:
+```{r}
+x_train = select(ds_train, -c(id, questionable_domain))
+y_train <- ds_train$questionable_domain
+x_test = select(ds_test, -c(id, questionable_domain))
+y_test = ds_test$questionable_domain
+
+xgb_model = train(x = x_train,
+                      y = y_train,
+                      trControl = trainControl(method  = "cv", number  = 10, classProbs = F),
+                      method = "xgbTree",
+                      tuneGrid = expand.grid(nrounds = c(50,100,150,200), max_depth = c(2,5), eta = 0.05, gamma = 0.01, 
+                                      colsample_bytree = c(0.3,0.7), min_child_weight=0, subsample = 0.7),
+                      verbosity = 0)
+
+xgb_results <- predict(xgb_model, x_test)
+xgb_conf <- confusionMatrix(xgb_results, y_test)
+xgb_conf
+```
+
+We got, relatively, good results, but our model still struggles identifying questionable tweets.
+
+Let's see the variable importance:
+```{r}
+ggplot(varImp(xgb_model))
+```
+
+## Conclusion
+The biggest challenge was in the data pre-processing and feature engineering part, specially, dealing with the tweet’s content - the attribute **description**. 
+The reality is that it is not trivial to classify some information as questionable or not. For a particular and reduced data set, a simple syntactic and/or semantic analysis may provide good results, but, overall, it would requires us to process the statement being said and factually check it, against a knowledge base. 
+For this particular problem, future work could pass from gathering new features, incorporating the time stamps of the tweets and gather even more data, in order to improve our classifications models. With a good model, Twitter could use this in order to stop, or, at least, reduce, the spread of misinformation. In fact, it would be interesting to test this model in the 2024 upcoming elections, since it’s expected to be, again, a race between Biden and Trump.
