@@ -1,0 +1,608 @@
+---
+title: "Forest Fires in Portugal"
+author:
+  - "Pedro Mota"
+  - "Tatiana Araújo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("C:/Users/00mot/Desktop/DM1/Forest-Fires-in-Portugal")
+```
+
+# Introduction
+Forest fires are a very important issue that negatively affects climate change. Typically, the causes of forest fires are those oversights, accidents and negligence committed by individuals, intentional acts and natural causes. The latter is the root cause for only a minority of the fires.
+Their harmful impacts and effects on ecosystems can be major ones. Among them, we can mention the disappearance of native species,  the increase in levels of carbon dioxide in the atmosphere, the earth’s nutrients destroyed by the ashes, and the massive loss of wildlife. 
+Data mining techniques can help in the prediction of the cause of the fire and, thus, better support the decision of taking preventive measures in order to avoid tragedy. In effect, this can play a major role in resource allocation, mitigation and recovery efforts. 
+The ICFN - Nature and Forest Conservation Institute has the record of the list of forest fires that occurred in Portugal for several years. For each fire, there is information such as the site, the alert date/hour, the extinction date/hour, the affected area and the cause type (intentional, natural, negligent, rekindling or unknown).
+
+The goal of this practical assignment is to build a machine learning model to predict the cause type of a forest fire: intentional or non-intentional.
+
+For all the analysis, we used the language R and some of its packages from the CRAN, which we will load now:
+```{r Library importation,warning=FALSE,message=FALSE}
+library(tidyverse)
+library(dlookr)
+library(lubridate)
+library(VIM)
+library(rnoaa)
+library(cowplot)
+library(DMwR)
+library(caret)
+library(naivebayes)
+library(rpart)
+library(rpart.plot)
+library(adabag)
+library(ranger)
+library(xgboost)
+library(pROC)
+```
+
+
+# Data Importation
+We will start, by reading the .csv file, containing the training data, as a tibble.
+``` {r Data Importation, warning=FALSE,message=FALSE}
+ds <- as_tibble(read_csv("fires_train.csv", na = c("-", "NA")))
+```
+
+A first glimpse:
+```{r}
+glimpse(ds)
+```
+One can see that, the columns *id*, *origin* and *intentional_cause* are wrongly typed. In order to do fix this, we convert them to their correct types:
+```{r Type conversion}
+ds$id <- as.integer(ds$id)
+ds$origin <- as.factor(ds$origin)
+ds$intentional_cause <- as.factor(ds$intentional_cause)
+```
+
+# Data clean-up and pre-processing
+Before we start the classification task, it's very important that we access the quality of our data, since poor data quality poses several challenges to the effective data analysis.
+
+We will start by looking for **missing values** and **duplicate data**, using the package *dlookr*.
+
+```{r Overview}
+overview(ds)
+```
+As one can see, there's no duplicate data, but there are a lot of missing values, so we went finding which are the 6 columns with missing values and how many they are:
+```{r Checking NAs,warning=FALSE,message=FALSE, echo=TRUE}
+ds %>% select(find_na(.)) %>% diagnose()
+```
+
+From this diagnose, we can see that only the features *region*, *extinction_date*, *extinction_hour*, *firstInterv_date*, *firstInterv_hour* and *alert_source* have missing values. 
+
+In particular, the column *alert_source* is all missing values, so we can immediately drop it:
+```{r Removing alert_source, echo=F}
+ds <- select(ds, -alert_source)
+```
+
+Regarding the feature *region*, which has 1206 missing values in total, we don't need to worry about imputating the data, since the information given by the *region* is too much broader to be useful in the prediction task. The same analysis is applied to the attributes *municipality* and *parish*, but, in both of them, the information in them is too specific. Also, we have the attributes *lat* and *lon*, which completely determines the location of the fire. Hence, we just kept the *district* attribute, which is in a sweet spot between specificity and vagueness.
+```{r Removing region district municipality and parish, echo=F}
+ds <- select(ds, -c(region, municipality))
+```
+
+Note that we didn't drop the attribute *parish* already, since it will later useful in an imputation.
+
+Concerning the variable *district*, we went finding which districts and how many are there, in our data set.
+```{r}
+distinct(data.frame(ds$district))
+```
+
+As we can see, there are 19 different districts, but, two of them ("Viana do Castelo" and "Viana Do Castelo") refer to the same district ("Viana do Castelo"), but are considered different, due to different capitalization. We could normalize all districts to lower case, for instance, but since the problem only appeared with "Viana do Castelo", we prefered instead to normalized all cases with "Viana Do Castelo" to "Viana do Castelo":
+```{r, echo=F}
+ds$district[ds$district == "Viana Do Castelo"] = "Viana do Castelo"
+ds$district <- as.factor(ds$district)
+```
+
+Regarding the *alert_date*, *extinction_date* and *firstInterv_date* datetime attributes, we assumed that the time field within them is wrong and we substituted them by the attributes *alert_hour*, *extinction_hour* and *firstInterv_hour* and we called these new attributes *alert_datetime*, *extinction_datetime* and *firstInterv_datetime*, respectively.
+```{r Fixing datetime attributes, warning=F, message=F, results='hide'}
+ds$alert_date = as.Date(ds$alert_date)
+ds$extinction_date = as.Date(ds$extinction_date)
+ds$firstInterv_date = as.Date(ds$firstInterv_date)
+
+ds <- mutate(ds, alert_datetime = with(ds, ymd(alert_date) + hms(alert_hour)))
+ds <- mutate(ds, extinction_datetime = with(ds, ymd(extinction_date) + hms(extinction_hour)))
+ds <- mutate(ds, firstInterv_datetime = with(ds, ymd(firstInterv_date) + hms(firstInterv_hour)))
+
+ds <- select(ds, -c(alert_date, alert_hour, extinction_date, extinction_hour, firstInterv_date, firstInterv_hour))
+```
+
+Now, concerning the attributes *village_veget_area* and *total_area*, we decide to remove them since they are redundant, because they are just the sum of the feature *village_area* and *vegetation_area* and the the sum of the feature *village_area*, *vegetation_area* and *farming_area*, respectively. 
+```{r Removing village_veget_area and total_area, echo=FALSE}
+ds <- select(ds, -c(village_veget_area, total_area))
+```
+
+Regarding the attributes *lat* and *lon*, the latitude and longitude coordinates of the location of the fire, respectively, they are represented as characters, which isn't optimal for comparisons purposes. We could separate, for the latitude and longitude, the degrees, minutes and seconds measures and then convert them into numeric values, making a total of 6 features to represent the coordinates. Having 6 features representing the coordinates seemed exaggerated and we want to avoid the curse of high-dimensionality, so we look into other ways of representing the coordinates.
+
+- The first idea was to convert the coordinates into a 3D coordinate space, where we would only have 3 features. Also, in the 3D coordinate space, close points are also close in reality, unlike in the coordinate system, where two extreme values can, actually, be very close together.
+
+- The second idea was to convert the coordinates into a decimal representation. In this case, we have just 2 features to represent the coordinates and it's already in the form that will need later, in order to get the temperatures.
+
+With this in mind and since, in our case, we are only working with latitudes and longitudes within Portugal, which means there no extreme coordinates that are very close in reality, we the chose the decimal representation.
+
+```{r coordinate_to_decimal function}
+coordinate_to_decimal <- function(coordinate) {
+  num = "(([0-9]+\\.[0-9]+)|([0-9]+))" # Regexp for integer and real numbers
+  
+  # Extract the numbers from the coordinate
+  # Note that parsed_coordinate[1] is the degrees of the coordinate, parsed_coordinate[2] the minutes and parsed_coordinate[3] the seconds.
+  parsed_coordinate <- as.double(str_extract_all(coordinate, num, simplify=TRUE)) 
+  
+  # Convert the coordinates to a decimal representation
+  return (parsed_coordinate[1] + parsed_coordinate[2]/60 + parsed_coordinate[3]/3600)
+}
+coordinate_to_decimal = Vectorize(coordinate_to_decimal)
+
+ds = mutate(ds, lat = coordinate_to_decimal(lat), lon = -1 * coordinate_to_decimal(lon))
+```
+
+Also, we've noticed that we have now missing values for the *lon* attribute. We suspected that was because of some strange values that couldn't be parsed with the function *str_extract_all*, from the package *stringr*, so we went finding them:
+
+```{r Looking for NAs again}
+ds[is.na(ds$lon),]
+```
+
+Only 3 observations weren't rightful parsed, which correspond to the IDs 2522, 6817 and 8690. Looking in the original data set, they have the following values for the *lon* attribute, respectively: 0.29930555555555555, 0.36041666666666666 and 0.31319444444444444. Looking at the values, they seem to be the coordinates but already in a decimal representation. Anyway, we decide to maintain them as missing values and then, later, imputate them.
+
+Finally, we checked if there are outliers. Namely regarding the *lat* and *lon* attributes, as one can see in the boxplots below. We considered a value to be an outlier if it's out of the range [1st Quartile - 1.5\*IQR, 3rd Quartile + 1.5\*IQR]. 
+```{r Boxplot for the lat and lon attribute, warning=F, message=F}
+lon_boxplot <- ggplot(ds) + geom_boxplot(aes(x = "Longitude", y=lon))
+lat_boxplot <- ggplot(ds) + geom_boxplot(aes(x = "Latitude", y=lat))
+
+plot_grid(lon_boxplot, lat_boxplot, labels = "AUTO")
+```
+
+We went further checking, for all numeric attributes, how many outliers are there: 
+```{r Checking outliers}
+ds %>% summarize(across(c(where(is.numeric), -id), ~length(boxplot(., plot=FALSE)$out)))
+```
+
+We just just take care of the outliers regarding the *lat* and *lon* attributes. We will turn them into missing values, and then imputate them, using the information given by the *district* and the *parish* variables, which determine, quite well, the *lat* and *lon* variables:
+```{r Remove outliers from lat and lon attributes}
+lat_outliers <- boxplot.stats(ds$lat)$out
+lon_outliers <- boxplot.stats(ds$lon)$out
+
+ds$lat[ds$lat %in% c(lat_outliers)] = NA
+ds$lon[ds$lon %in% c(lon_outliers)] = NA
+
+rm(lat_boxplot, lon_boxplot, lat_outliers, lon_outliers)
+
+ds <- as_tibble(VIM::kNN(ds, variable = c("lat", "lon"), dist_var=c("district", "parish"), k=7)) %>% select(-ends_with("_imp"))
+ds <- select(ds, -parish)
+```
+
+Note that we also removed the variable *parish*, for the reasons stated before.
+
+We didn't remove the outliers from the other features, since we think that they aren't noise, as in the *lat* and *lon*, but informative to our prediction task.
+
+Having almost fixed all data quality problems with the original data set, we tried to use our domain knowledge of the data to create new features, using the original ones, hoping that they will capture new important information much more efficiently than the original features, which will help us solving the problem.
+
+For all of the new attributes that we will create, we made the assumption that the datetime given in the *alert_datetime* is a good approximation of the datetime of the starting of the fire and this is rather a fair assumption, since a fire is, usually, immediately noticed.
+
+We will start by using the attributes *extinction_datetime* and the *alert_datetime*, which we think that they can provide relevant information, but not as they are. That is, it's irrelevant the datetime by itself, but the difference, in minutes, within them, may be useful. So we created the *burning_time* attribute, which is the duration, in minutes, of the fire. 
+```{r}
+ds <- mutate(ds, burning_time = as.double(difftime(extinction_datetime, alert_datetime, units="mins")))
+```
+
+Also, we noticed that there are cases with nonpositive values for the *burning_time* attribute: 
+```{r}
+min(ds$burning_time, na.rm=TRUE)
+```
+
+Since this values make no sense, we made them missing values, which we will later imputate, based on the nearest neighbors:
+```{r}
+ds$burning_time[ds$burning_time <= 0] = NA
+```
+
+Before we continue, we will now fix the missing values regarding the *firstInterv_datetime* and *extinction_datetime* variables, by imputating them based on the k-nearest neighbors method. We made this imputation now, after the creation of the *burning_time* attribute, in order to avoid having more outliers in the *burning_time* attribute, since, for instance, from the imputation, one case could have the first intervation in 2015 and the date of extinction in 2014, which makes no sense. So, in the case where there were missing values for the one of the datetimes, the *burning_time* variable will also have a missing value (plus the ones added before, which had nonpositive values), which we will also imputate:
+```{r Imputating NAs}
+ds <- mutate(ds, alert_datetime=as.integer(alert_datetime), extinction_datetime=as.integer(extinction_datetime), firstInterv_datetime=as.integer(firstInterv_datetime))
+
+ds <- as_tibble(VIM::kNN(ds, variable = c("firstInterv_datetime", "extinction_datetime", "burning_time"), k=11)) %>% select(-ends_with("_imp"))
+
+ds <- mutate(ds, alert_datetime       = as_datetime(alert_datetime), 
+                 extinction_datetime  = as_datetime(extinction_datetime), 
+                 firstInterv_datetime = as_datetime(firstInterv_datetime))
+find_na(ds)
+```
+
+We will now create some variables relative to the date of the fire. Firstly, the week day, **weekday**, a factor attribute, representing the week day when the fire started:
+```{r getSeason function}
+ds <- mutate(ds, weekday = as.factor(weekdays(alert_datetime)))
+```
+
+We also created a **date** attribute, having a value between 0 and 1, representing the part of the year when the fire started:
+```{r date function}
+getDate = function(datetime) {
+  month = as.integer(month(datetime))
+  day = as.integer(day(datetime))
+  
+  days = c(31,28,31,30,31,30,31,31,30,31,30,31)
+  
+  date <- (sum(days[0:(month-1)]) + day) / 365
+}
+getDate = Vectorize(getDate)
+ds <- mutate(ds, date = getDate(alert_datetime))
+```
+
+For complementing the **date** attribute, we made two new attributes:
+
+- **year**, which is a factor attribute, having the value 1 if the fire was in the year 2014 or 2, otherwise (that is, the fire was in the year 2015).
+
+- **hour**, a integer attribute, having the hour when the fire occurred.
+
+```{r}
+getYear = function(datetime) {
+  ifelse(as.integer(year(datetime)) == 2014, 1, 2) 
+}
+
+ds <- mutate(ds, year = as.factor(getYear(alert_datetime)))
+
+ds <- mutate(ds, hour = as.integer(hour(alert_datetime)))
+```
+
+Concerning the **village_area**, **farming_area** and **vegetation_area** attributes, we make of them two new attributes: the **burned_village_area** and **burned_green_area**, which represent, naturally, the village area burned and the green area burned, respectively: 
+```{r}
+ds = mutate(ds, burned_village_area = village_area, burned_green_area = farming_area + vegetation_area)
+ds = select(ds, -c(village_area, farming_area, vegetation_area))
+```
+
+Finally, we decided to add information about the weather, mainly the temperature and the precipitation, in the attribute **max_temp**, a numeric attribute, having the highest temperature achieved in that day and in the attribute **prcp**, also a numeric attribute, having the values of precipitation, also, for that day, respectively:
+```{r Temp and Prcp, eval=F}
+require(devtools)
+
+load("./station_data.RData")
+
+get_nearby_stations <- function(d, lat, lon){
+  df <- data.frame(
+    id = c(d), 
+    latitude = c(lat),
+    longitude = c(lon),
+    stringsAsFactors = FALSE
+  )
+
+  nearby_stations <-  meteo_nearby_stations(lat_lon_df = df,
+                                            station_data = station_data, radius = 1000, 
+                                            var = c("TMAX","TMIN","PRCP"),
+                                            year_min = 2014, year_max = 2015)
+
+  return(nearby_stations)
+}
+
+add_temp_max <- function(nearby_stations, actual_date){
+  for(i in 1:length(nearby_stations[[1]]$id)){
+    weather_data <- ghcnd_search(nearby_stations[[1]]$id[i], var = c("TMAX") , date_min = actual_date, date_max = actual_date)
+    weather_frame <- do.call(rbind.data.frame, weather_data['tmax'])
+    t_max = weather_frame$tmax[1]
+    if(!is.na(t_max)){
+      return(t_max)
+    }
+  }
+  return(NA)
+}
+
+add_prcp <- function(nearby_stations, actual_date){
+  for(i in 1:length(nearby_stations[[1]]$id)){
+    weather_data <- ghcnd_search(nearby_stations[[1]]$id[i], var = c("PRCP") , date_min = actual_date, date_max = actual_date)
+    weather_frame <- do.call(rbind.data.frame, weather_data['prcp'])
+    prcp = weather_frame$prcp[1]
+    
+    if(!is.na(prcp)){
+      return(prcp)
+    }
+  }
+  
+  return(NA)
+}
+
+add_new_values <- function(ds){
+  for(i in 1:length(ds$lat)) {
+    print(i)
+    nearby_stations = get_nearby_stations(ds$district[i],ds$lat[i], ds$lon[i])
+    ds$max_temp[i] = add_temp_max(nearby_stations, as_date( ds$alert_datetime[i]))
+    ds$prcp[i] = add_prcp(nearby_stations,  as_date(ds$alert_datetime[i]))
+    if(i == nrow(ds))
+      break
+  }
+  return(ds)
+}
+ds <- add_new_values(ds)
+```
+
+<!-- To avoid looking up again, in the station data, the temperature and prcp values --> 
+```{r, include=FALSE}
+maxTemp = read_csv("fires_train_maxTemp.csv")
+prcp = read_csv("fires_train_prcp.csv")
+
+ds = merge(ds, maxTemp, by = "id")
+ds = merge(ds, prcp, by = "id")
+
+rm(maxTemp, prcp)
+```
+
+We can finally drop the date time attributes, since we don't need them anymore:
+```{r}
+ds <- select(ds, -c(alert_datetime, extinction_datetime, firstInterv_datetime))
+```
+
+Also, we found another problem with our data set, that is our data set is very imbalanced, as one can see:
+```{r}
+table(ds$intentional_cause)
+```
+
+Roughly, 70% of the cases are fires with a non-intentional cause, with only 30% of the cases being fires with an intentional cause. This can present a problem, since our minority class won't have a representative sample of examples and some of our models will be biased towards the majority class. So, in order to fix this, we used a technique called "SMOTE", in order to balance our data set:
+
+```{r, eval=F}
+balanced.ds <- SMOTE(intentional_cause ~ ., 
+                     data = as.data.frame(ds), 
+                     perc.over = 100,
+                     k = 11, 
+                     perc.under = 200) 
+```
+
+What we found is that balancing the data was causing low scores later, in the predictive part, so we decided to keep our imbalanced data set.
+
+Relatively to the data cleaning and pre-processing, we are done. Regarding the normalization of the values, vital to some methods, that will be done in the prediction part, since some methods provide the option to do this normalization.
+
+A final glimpse:
+```{r Final glimpse}
+ds = relocate(ds, intentional_cause, .after = last_col())
+glimpse(ds)
+```
+
+# Data exploratory analysis
+We will now present some data exploratory analysis, which helped when making some decisions regarding the data pre-processing part and find correlations in the data.
+
+Since we decided to keep the outliers of the attributes regarding the burned areas, because we think they aren't wrong values, plots regarding these attribute rarely provided useful information.
+
+We started by looking for the distribution of the fires' origin:
+```{r}
+ggplot(ds, aes(x=origin)) + geom_bar(aes(fill=intentional_cause)) + ggtitle("Distribution of the cause by the fire's origin") + labs(fill = "Cause")  + xlab("Origin") + ylab("Quantity")
+```
+
+As we can see, most of the fires were due to firepits. Also, from a first visualization, we can see the inbalance in our data set.
+
+From the plot below, one can see that the most of the fires are distributed evenly through the week days. In fact, as we see later in the predictive modelling, the week day wasn't an important variable to the models, since it has low correlation with the cause:
+```{r}
+ggplot(ds, aes(x=weekday)) + geom_bar(aes(fill=intentional_cause)) + ggtitle("Distribution of the cause by the fire's origin week day") + labs(fill = "Cause")  + xlab("Week day") + ylab("Quantity")
+```
+
+We'll now explore the locations of the fires and their origins:
+```{r}
+ggplot(ds, aes(x=lon, y =lat)) + geom_point(aes(color=origin)) + ggtitle("Origin of fires by latitude and longitude") + xlab("Longitude") + ylab("Latitude")
+```
+
+From this, it is clear that most of the fires in our data set occurred in the north region of Portugal and, again, we can detect firepits as the major cause of the fires, which is linked to human activity and thus may provide useful information regarding the cause of the fire.
+
+We can also go deeper and look within the districts, to see if there's some correlation with the intentionality of the fire:
+```{r}
+ggplot(ds, aes(x=district)) + geom_bar(aes(fill=intentional_cause)) + scale_x_discrete(guide = guide_axis(n.dodge = 3)) + labs(fill = "Cause") + ggtitle("Cause by district") + xlab("District") + ylab("Quantity")
+```
+
+Other interesting statistics include:
+
+- The "preferred" hour for a fire to start is at 2PM:
+```{r}
+mode <- function(x) {
+  ux <- unique(x)
+  return(ux[which.max(tabulate(match(x, ux)))])
+}
+
+mode(ds$hour)
+```
+- On average, fires burned about 2 hours and half:
+```{r}
+mean(ds$burning_time) / 60
+```
+- On average, fires burned about 1.85km of village area and 3.07km of green area:
+```{r}
+mean(ds$burned_village_area)
+```
+```{r}
+mean(ds$burned_green_area)
+```
+- On average, the temperatures got higher in 2014 that in 2015: 
+```{r}
+ds %>% group_by(year) %>% summarize(avg_max_temp = mean(max_temp))
+```
+
+But, still, the number of non-intentional fires in 2015 is higher than in 2014:
+```{r}
+ggplot(ds, aes(x=year)) + geom_bar(aes(fill=intentional_cause)) + ggtitle("Distribution of the cause by the year") + labs(fill = "Cause")  + xlab("Year") + ylab("Quantity")
+```
+
+# Predictive modelling
+
+We'll now start, finally, the predictive modelling.
+
+Firstly, let's partition our data set, with 70% of our data to be used to train and the other 30% to be used for testing:
+```{r}
+set.seed(42)
+
+inTrain <- createDataPartition(y = ds$intentional_cause, p = 0.7, list = FALSE)
+ds_train <- ds %>% dplyr::slice(inTrain)
+ds_test <- ds %>% dplyr::slice(-inTrain)
+```
+
+## k-Nearest Neighbors
+
+Firstly, we will try the k-Nearest neighbors method:
+```{r KNN}
+fit <- train(intentional_cause ~ .,
+             method     = "knn",
+             tuneGrid   = expand.grid(k = seq(7, 15, by = 2)),
+             trControl  = trainControl(method  = "cv", number = 10),
+             metric     = "Accuracy",
+             preProc    = c("center", "scale"),
+             data       = select(ds, -id))
+fit
+```
+
+As we can see, the highest accuracy we can get is of about 72%, with k = 11.
+
+## Naive Bayes
+We shall now try the Naive Bayes approach, using the Laplace correction.
+
+```{r NB}
+m <- naive_bayes(intentional_cause ~ ., data = select(ds_train, -id), laplace=1)
+preds <- predict(m, select(ds_test, -c(id, intentional_cause)))
+confusionMatrix(ds_test$intentional_cause, preds)
+```
+
+```{r,warning=F, message=F}
+auc <- roc(as.integer(ds_test$intentional_cause)-1, as.integer(preds)-1)
+```
+```{r}
+plot(auc, ylim=c(0,1), print.thres=TRUE, main=paste('AUC:',round(auc$auc[[1]],2)))
+```
+
+We got an accuracy of about 68%, which is worse than the k-NN method, where we got an accuracy of 72%, with k = 11.
+
+## Decision Tree
+We shall try also a plain decision tree: 
+```{r}
+m <- rpart(intentional_cause ~ ., select(ds_train, -id))
+rpart.plot(m)
+```
+
+```{r}
+preds <- predict(m, select(ds_test, -c(id, intentional_cause)))
+
+preds = as.factor(as.integer(preds[1:nrow(ds_test)] < 0.5))
+
+confusionMatrix(ds_test$intentional_cause, preds)
+```
+
+```{r,warning=F, message=F}
+auc <- roc(as.integer(ds_test$intentional_cause)-1, as.integer(preds)-1)
+```
+```{r}
+plot(auc, ylim=c(0,1), print.thres=TRUE, main=paste('AUC:',round(auc$auc[[1]],2)))
+```
+
+We got an accuracy of about 74%, which is better than the k-NN method.
+
+Regarding the importance of the variables, the *district* and *date* attributes were the most important:
+```{r}
+m$variable.importance
+```
+
+We will now explore ensemble approaches.
+
+## Bagging
+Firstly, we will try a bagging approach:
+```{r Bagging}
+m <- bagging(intentional_cause ~ ., ds_train, control = rpart.control(maxdepth = 5), par=TRUE)
+preds <- predict(m, ds_test)
+confusionMatrix(as.factor(preds$class), ds_test$intentional_cause)
+```
+
+```{r,warning=F, message=F}
+auc <- roc(as.integer(ds_test$intentional_cause)-1, as.integer(preds$class)-1)
+```
+```{r}
+plot(auc, ylim=c(0,1), print.thres=TRUE, main=paste('AUC:',round(auc$auc[[1]],2)))
+```
+
+We got an accuracy of about 73%, which is worse than the Decision Tree model.
+
+Regarding the importance of the variables, the *district* and *date* attributes were, again, the most important:
+```{r}
+m$importance
+```
+
+
+Regarding the importance of the variables, the *lat* and *lon* attributes were the most important:
+```{r RF: Importance of variables}
+m$variable.importance
+```
+
+## XGBoost
+Finally, we shall try the XGBoost model, with 250 boosting iterations.
+```{r, results='hide'}
+m <- xgboost(data = data.matrix(select(ds_train, -c(id, intentional_cause))),
+             label = as.integer(ds_train$intentional_cause)-1,
+             nrounds = 250,
+             objective = "binary:logistic",
+             eval_metric = "auc")
+```
+
+```{r}
+preds <- predict(m, data.matrix(select(ds_test, -c(id, intentional_cause))), reshape=T)
+
+preds <- as.numeric(preds > 0.5)
+
+confusionMatrix(factor(preds), ds_test$intentional_cause)
+```
+
+```{r,warning=F, message=F}
+auc <- roc(as.integer(ds_test$intentional_cause)-1, as.integer(factor(preds))-1)
+```
+```{r}
+plot(auc, ylim=c(0,1), print.thres=TRUE, main=paste('AUC:',round(auc$auc[[1]],2)))
+```
+
+We got an accuracy of about 77%, making it the best model tested so far.
+
+Regarding the importance of the variables, the *lon* and *lat* attributes were, again, the most important:
+```{r, results='hide'}
+varImp <- xgb.importance(model=m)
+xgb.plot.importance(varImp)
+```
+
+## AdaBoost
+```{r AdaBoost}
+m <- boosting(intentional_cause ~ ., select(ds_train, -id))
+preds <- predict(m, select(ds_test, -c(id, intentional_cause)))
+confusionMatrix(factor(preds$class), ds_test$intentional_cause)
+```
+
+```{r,warning=F, message=F}
+auc <- roc(as.integer(ds_test$intentional_cause)-1, as.integer(factor(preds$class))-1)
+```
+```{r}
+plot(auc, ylim=c(0,1), print.thres=TRUE, main=paste('AUC:',round(auc$auc[[1]],2)))
+```
+
+We got an accuracy of about 78%, a bit higher than the XGBoost model, making this model the one with the highest accuracy found so far.
+
+Regarding the importance of the variables, again, the *lon* and *lat* attributes were the most important:
+```{r}
+m$importance
+```
+
+## Random Forests
+We turn our attention now, for Random Forests. With some experimentation, we fixed the number of trees in 1500 and number of variables to possibly split at in each node in 13.
+
+```{r Random Forests}
+m <- ranger(intentional_cause ~ .,
+            num.trees = 1500,
+            data=select(ds_train, -id),
+            importance='impurity',
+            mtry = 13)
+
+preds <- predict(m, select(ds_test, -c(id, intentional_cause)))
+
+confusionMatrix(preds$predictions, ds_test$intentional_cause)
+```
+
+```{r,warning=F, message=F}
+auc <- roc(as.integer(ds_test$intentional_cause)-1, as.integer(preds$predictions)-1)
+```
+```{r}
+plot(auc, ylim=c(0,1), print.thres=TRUE, main=paste('AUC:',round(auc$auc[[1]],2)))
+```
+
+We got an accuracy of about 78%, virtually the same as in the AdaBoost, making this model, also, one with the highest accuracy obtained and it was the one with the best perfomance obtained in the Kaggle competition.
+
+Regarding the importance of the variables, again, the *lon* and *lat* attributes were the most important:
+```{r}
+m$variable.importance
+```
+
+# Conclusion
+The biggest challenge was in the data pre-processing and feature engineering part. Especially, in the feature engineering part, were we tried to use some domain knowledge.
+
+Future work could pass from creating new features, re-check the discard predictors and gather more data relatively to the fires, in order to improve our classifications models.
+
+With a good model, the authorities could use this in their research, in order to combate the criminals and the deforestation due to fires. 
