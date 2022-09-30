@@ -1,0 +1,46 @@
+{% extends 'general-template.html'  %}
+{% block content %}
+
+<h1>Label detection</h1>
+
+<table>
+    <tr>
+        <th>Filename</th>
+        <th>Annotations</th>
+        <th>Image</th>
+    </tr>
+    {% for result in data.results %}
+    <tr>
+        <td>
+            <a href="https://storage.googleapis.com/{{ data.bucket_name }}/{{ result.filename }}">
+                {{ result.filename }}
+            </a>
+        </td>
+        <td>
+            <table>
+                <tr>
+                    <th>Label</th>
+                    <th>Confidence</th>
+                </tr>
+                {% for annotation in result.annotations %}
+                <tr>
+                    <td>
+                        {{ annotation.label }}
+                    </td>
+                    <td>
+                        {{ annotation.score }}
+                    </td>
+                </tr>
+                {% endfor %}
+            </table>
+        </td>
+        <td>
+            <a href="https://storage.googleapis.com/{{ data.bucket_name }}/{{ result.filename }}">
+                <img src="https://storage.googleapis.com/{{ data.bucket_name }}/{{ result.filename }}" width="300" />
+            </a>
+        </td>
+    </tr>
+    {% endfor %}
+</table>
+
+{% endblock %}

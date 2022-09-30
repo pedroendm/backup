@@ -1,0 +1,10 @@
+Falar com o professor:
+ - HTML template Multiple Search, erro a printar, não dou espaço                               -
+ - A key que gerei e guardei em JSON, posso enviar?                                            - não preciso de enviar no zip 
+ - Não consigo dar deploy pq diz que o cloud vision não está instalado, mas funciona locally?  - FEITO (era acrescentar no requirements)
+
+Acabar:
+ - Relatório
+ - Extra do Docker file
+
+
